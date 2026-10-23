@@ -11,6 +11,8 @@
 //   DEFAULT_SERVICE  本地服务默认地址, 如 http://localhost:8001 (可选)
 //   TG_BOT_TOKEN     Telegram 机器人 Token (可选), 如 123456:ABC...
 //   TG_CHAT_ID       Telegram 接收提醒的 chat_id (可选), 群组为负数
+//   BARK_URL         Bark 服务器地址 (可选), 默认 https://api.day.app; 面板里保存的配置优先
+//   BARK_KEY         Bark 设备 key (可选), 面板"Bark 推送"里保存的配置优先
 //
 // 访问方式: 打开 https://你的域名 , 输入 PASSWORD 登录后进入管理面板。
 //
@@ -463,7 +465,7 @@ async function storeDel(env, key) {
 }
 
 async function getMeta(env) {
-  const meta = { chats: [], alerts: {}, botToken: "", paused: null, accounts: [], curAcc: "" };
+  const meta = { chats: [], alerts: {}, botToken: "", paused: null, accounts: [], curAcc: "", bark: { url: "", key: "" } };
   if (!store(env)) return meta;
   const saved = (await storeGet(env, META_KEY)) || {};
   meta.alerts = (saved && saved.alerts) || {};
@@ -474,6 +476,13 @@ async function getMeta(env) {
     await storePut(env, META_KEY, { ...saved, alerts: {}, alertsV2: true });
   }
   meta.botToken = str(saved && saved.botToken);
+  // Bark 推送 (iOS): 服务器地址 + 设备 key, 与 Telegram 独立, 两者都配则同时推送
+  const bk = (saved && saved.bark) || {};
+  meta.bark = { url: str(bk.url), key: str(bk.key) };
+  meta.alertCfg = (saved && saved.alertCfg) || null;
+  // 账号名称 / Token 覆盖表 (任一账号都可编辑, 含环境变量默认账号)
+  meta.accNames = (saved && saved.accNames) || {};
+  meta.accTokens = (saved && saved.accTokens) || {};
   meta.paused = (saved && saved.paused) || null;
   meta.accounts = Array.isArray(saved && saved.accounts) ? saved.accounts : [];
   meta.curAcc = str(saved && saved.curAcc);
@@ -492,6 +501,10 @@ async function saveMeta(env, meta) {
     alerts: meta.alerts,
     alertsV2: true, // 已完成"提醒默认关"迁移的标记 (见 getMeta)
     botToken: meta.botToken || "",
+    bark: meta.bark || { url: "", key: "" },
+    alertCfg: meta.alertCfg || null,
+    accNames: meta.accNames || {},
+    accTokens: meta.accTokens || {},
     paused: meta.paused || null,
     accounts: meta.accounts || [],
     curAcc: meta.curAcc || "",
@@ -503,15 +516,62 @@ async function saveMeta(env, meta) {
 // 名为"默认账号"的隐式账号存在 (不可删除), 未选账号或存储不可用时回退到它。
 // 提醒 (alerts/watch/隧道状态) 按账号隔离: 键里带账号 ID, 互不串扰。
 function accountList(meta, env) {
+  // 名称与 Token 都可被面板覆盖 (meta.accNames / accTokens), 默认账号也不例外 —— 不给任何账号写死配置
+  const names = (meta && meta.accNames) || {};
+  const toks = (meta && meta.accTokens) || {};
   const list = [];
-  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID) list.push({ name: "默认账号", token: "", acc: env.CF_ACCOUNT_ID, builtin: true });
+  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID)
+    list.push({
+      name: str(names[env.CF_ACCOUNT_ID]) || "默认账号",
+      token: str(toks[env.CF_ACCOUNT_ID]) || "",
+      acc: env.CF_ACCOUNT_ID,
+      builtin: true,
+    });
   for (const a of (meta && meta.accounts) || [])
-    if (a && str(a.acc)) list.push({ name: str(a.name) || str(a.acc), token: str(a.token), acc: str(a.acc) });
+    if (a && str(a.acc))
+      list.push({
+        name: str(names[str(a.acc)]) || str(a.name) || str(a.acc),
+        token: str(toks[str(a.acc)]) || str(a.token),
+        acc: str(a.acc),
+      });
   return list;
 }
 function pickAccount(meta, env, sel) {
   const list = accountList(meta, env);
   return list.find((a) => a.acc === str(sel)) || list[0] || null;
+}
+
+// ---- Bark 推送 (iOS) ----
+// 服务器地址 + 设备 key 都存在存储里 (meta.bark), 也可用环境变量 BARK_URL / BARK_KEY 兜底。
+// 发送优先 POST {base}/push, 失败再退回旧版 GET {base}/{key}/{title}/{body}。
+const BARK_DEFAULT = "https://api.day.app";
+const barkUrl = (env, meta) =>
+  str((meta && meta.bark && meta.bark.url) || env.BARK_URL || BARK_DEFAULT).trim().replace(/\/+$/, "") || BARK_DEFAULT;
+const barkKey = (env, meta) =>
+  str((meta && meta.bark && meta.bark.key) || env.BARK_KEY || "").replace(/[\s/]+/g, "");
+const barkReady = (env, meta) => !!barkKey(env, meta);
+async function barkSend(env, meta, text) {
+  const key = barkKey(env, meta);
+  if (!key) return { ok: false, error: "未配置 Bark 设备 key" };
+  const base = barkUrl(env, meta);
+  const title = "Cloudflare 隧道";
+  const body = String(text).replace(/\n/g, "\n");
+  const okCode = (j) => !!j && (j.code === 200 || j.code === 0);
+  const r = await rawAt(base + "/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_key: key, title, body, group: "CF隧道", level: "active", isArchive: 1 }),
+  });
+  let j = null;
+  try { j = JSON.parse(r.text); } catch (e) {}
+  if (okCode(j)) return { ok: true };
+  // 兼容只支持 /<key>/<title>/<body> 的旧版 bark 服务
+  const g = await rawAt(base + "/" + encodeURIComponent(key) + "/" + encodeURIComponent(title) + "/" + encodeURIComponent(body.replace(/\n/g, " · ")));
+  let k = null;
+  try { k = JSON.parse(g.text); } catch (e) {}
+  if (okCode(k)) return { ok: true };
+  const msg = (j && j.message) || (k && k.message) || str(r.text) || str(g.text) || ("HTTP " + r.status);
+  return { ok: false, error: "Bark: " + str(msg).slice(0, 160) };
 }
 
 const chatTargets = (env, meta) => {
@@ -524,7 +584,14 @@ const chatTargets = (env, meta) => {
 const alertsPayload = (env, meta, now = Date.now()) => ({
   kv: !!store(env),
   bot: !!env.TG_BOT_TOKEN || !!meta.botToken,
+  bark: {
+    has: barkReady(env, meta),
+    url: barkUrl(env, meta),
+    keyMask: barkKey(env, meta) ? barkKey(env, meta).slice(0, 4) + "…****" : "",
+    env: !!env.BARK_KEY && !(meta.bark && meta.bark.key),
+  },
   chats: meta.chats.map((c) => ({ name: c.name, id: c.id, ok: c.ok })),
+  cfg: alertCfg(meta),
   targets: chatTargets(env, meta).length,
   alerts: meta.alerts,
   // until:0 表示手动暂停 (无期限), until>now 表示限时暂停
@@ -545,8 +612,96 @@ function requireKv(env) {
 //   tunnel:state:<acc>:<id>  { on: 上次记录的状态, at: 时间 } (按账号隔离)
 //   watch:<签名>              { at: 上次检查时间 }
 // 与上次记录相比发生变化才提醒; 提醒前先写入新状态, 所以同一次变化只会提醒一次。
-const isUp = (t) => t.status === "healthy";
-const ST_TEXT = { healthy: "在线", degraded: "降级", down: "离线", inactive: "未启用" };
+const isUp = (t) => t.status === "healthy" || t.status === "degraded";
+const ST_TEXT = { healthy: "正常", degraded: "降级", down: "断连", inactive: "未启用" };
+
+// ---- 告警策略 / 可用性探测 ----
+const PROBE_TIMEOUT = 8000;        // 单次探测超时
+const PROBE_MIN_GAP = 90 * 1000;   // 两次探测的最小间隔 (面板刷新复用缓存结果)
+const alertCfg = (meta) => {
+  const c = (meta && meta.alertCfg) || {};
+  const hm = (v, def) => (/^\d{2}:\d{2}$/.test(str(v)) ? str(v) : def);
+  return {
+    probe: c.probe !== false,
+    degraded: !!c.degraded,
+    debounce: Math.min(5, Math.max(1, parseInt(c.debounce, 10) || 2)),
+    quietOn: !!c.quietOn,
+    quietStart: hm(c.quietStart, "23:00"),
+    quietEnd: hm(c.quietEnd, "08:00"),
+    tz: Number.isFinite(+c.tz) ? +c.tz : 8,
+  };
+};
+const hhmm = (ms, tz) => {
+  const d = new Date(ms + tz * 3600e3);
+  return String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+};
+function inQuiet(cfg, now) {
+  if (!cfg.quietOn || cfg.quietStart === cfg.quietEnd) return false;
+  const hm = hhmm(now, cfg.tz);
+  return cfg.quietStart < cfg.quietEnd
+    ? hm >= cfg.quietStart && hm < cfg.quietEnd
+    : hm >= cfg.quietStart || hm < cfg.quietEnd;
+}
+const probeWhy = (p) => (p.err ? p.err : "HTTP " + p.status) + (p.host ? " · " + p.host : "");
+
+// 实际访问路由域名: 隧道 healthy 但源站挂了 (502/超时) 也能发现
+async function probeHost(host, path) {
+  const url = "https://" + host + (path && path !== "/" ? path : "/");
+  const t0 = Date.now();
+  try {
+    const r = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      headers: { "User-Agent": "CF-Tunnel-Panel-Probe/1.0", "Cache-Control": "no-cache" },
+      signal: AbortSignal.timeout(PROBE_TIMEOUT),
+    });
+    const ms = Date.now() - t0;
+    try { await r.text(); } catch (e) {}
+    // 只有 5xx / 连接失败算真故障; 4xx 说明服务活着 (只是该路径要鉴权或不存在)
+    const ok = r.status < 500;
+    return { host, ok, status: r.status, ms, err: "" };
+  } catch (e) {
+    const ms = Date.now() - t0;
+    const to = e && (e.name === "TimeoutError" || /timeout|abort/i.test(String(e.message) + String(e.name)));
+    return { host, ok: false, status: 0, ms, err: to ? "超时" : "连接失败" };
+  }
+}
+
+async function probeTunnels(env, tunnels, meta, panelHost) {
+  const out = {};
+  const cfg = alertCfg(meta);
+  if (!cfg.probe) return out;
+  const last = await readState(env, "probe:last");
+  const fresh = last && Date.now() - (last.at || 0) < PROBE_MIN_GAP;
+  for (const t of tunnels) {
+    if (fresh) {
+      const c = await readState(env, "probe:tunnel:" + t.id);
+      if (c) { out[t.id] = c; continue; }
+    }
+    if (!t.up) { out[t.id] = { ok: null, skipped: true, at: Date.now() }; continue; }
+    let rules = [];
+    try {
+      const c = await cf(env, `/accounts/${env.cfAcc}/cfd_tunnel/${t.id}/configurations`);
+      rules = (c && c.config && c.config.ingress) || [];
+    } catch (e) {}
+    const hosts = [];
+    for (const r of rules) {
+      const h = str(r.hostname).toLowerCase().trim();
+      if (!h || h.indexOf("*") >= 0 || h === panelHost) continue;
+      if (hosts.some((x) => x.host === h)) continue;
+      hosts.push({ host: h, path: str(r.path) });
+    }
+    if (!hosts.length) { out[t.id] = { ok: null, skipped: true, at: Date.now() }; continue; }
+    const list = [];
+    for (const h of hosts) list.push(await probeHost(h.host, h.path));
+    const bad = list.filter((x) => !x.ok)[0] || list[0];
+    const agg = { ok: bad.ok, status: bad.status, ms: bad.ms, err: bad.err, host: bad.host, at: Date.now(), hosts: list };
+    out[t.id] = agg;
+    await storePut(env, "probe:tunnel:" + t.id, agg);
+  }
+  await storePut(env, "probe:last", { at: Date.now() });
+  return out;
+}
 
 const fmtT = (ms, tz = 8) => {
   const d = new Date(ms + tz * 3600 * 1000);
@@ -561,6 +716,44 @@ async function readState(env, key) {
   } catch (e) {
     return null;
   }
+}
+
+// "全部账户"视图: 逐账号跑一次检查并把结果合并, 每条隧道带上 acc/accName
+async function listAllAccounts(env) {
+  const meta = await getMeta(env);
+  const accs = accountList(meta, env);
+  const out = {
+    all: true,
+    accounts: accs.map((a) => ({ name: a.name, acc: a.acc })),
+    tunnels: [],
+    total: 0,
+    online: 0,
+    offline: 0,
+    kv: !!store(env),
+    alertOn: {},
+    probes: {},
+    alert: { sent: 0, error: "", last: 0, paused: false },
+  };
+  const errs = [];
+  for (const a of accs) {
+    const e2 = { ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc };
+    try {
+      const r = await runChecks(e2, await listTunnels(e2, `/accounts/${a.acc}/cfd_tunnel`));
+      for (const t of r.tunnels) out.tunnels.push({ ...t, acc: a.acc, accName: a.name });
+      Object.assign(out.alertOn, r.alertOn);
+      if (r.probes) Object.assign(out.probes, r.probes);
+      out.alert.sent += r.alert.sent || 0;
+      out.alert.paused = out.alert.paused || !!r.alert.paused;
+      if (r.alert.error && !out.alert.error) out.alert.error = r.alert.error;
+    } catch (e) {
+      errs.push(a.name + ": " + str((e && e.message) || e).slice(0, 120));
+    }
+  }
+  out.total = out.tunnels.length;
+  out.online = out.tunnels.filter((t) => t.up).length;
+  out.offline = out.total - out.online;
+  if (errs.length) out.alert.error = errs[0];
+  return out;
 }
 
 async function runChecks(env, list) {
@@ -596,30 +789,83 @@ async function runChecks(env, list) {
   if (watch && now - watch.at < MIN_GAP_MS) return result;
 
   const prev = await Promise.all(tunnels.map((t) => readState(env, "tunnel:state:" + accScope + ":" + t.id)));
+  const cfg = alertCfg(meta);
   const changed = tunnels.filter((t, i) => prev[i] && !!prev[i].on !== t.up && result.alertOn[t.id]);
+  // 降级 (部分连接器不可用) 单独提醒, 可在告警策略里开关
+  const degraded = cfg.degraded
+    ? tunnels.filter((t, i) => prev[i] && result.alertOn[t.id] && prev[i].st !== "degraded" && t.status === "degraded")
+    : [];
 
   // 先写状态再发消息: 并发请求下同一次变化也只提醒一次
   await Promise.all(
-    tunnels.map((t) => storePut(env, "tunnel:state:" + accScope + ":" + t.id, { on: t.up, at: now }))
+    tunnels.map((t) => storePut(env, "tunnel:state:" + accScope + ":" + t.id, { on: t.up, st: t.status, at: now }))
   );
   await storePut(env, watchKey, { at: now });
 
-  if (!changed.length) return result;
+  // 可用性探测: 真实访问每条路由的域名 (隧道 healthy 但源站 502/超时也能发现)
+  const probes = await probeTunnels(env, tunnels, meta, env.__panelHost || "");
+  result.probes = probes;
+  const probeMsgs = [];
+  for (const t of tunnels) {
+    const p = probes[t.id];
+    if (!p || p.skipped) continue;
+    const pk = "probe:state:" + accScope + ":" + t.id;
+    const pp = await readState(env, pk);
+    const fails = p.ok ? 0 : ((pp && pp.fails) || 0) + 1;
+    await storePut(env, pk, { ok: !!p.ok, fails, at: now });
+    if (!result.alertOn[t.id]) continue;
+    // 连续失败达到阈值才提醒, 避免一次抖动刷屏
+    if (!p.ok && fails === cfg.debounce) probeMsgs.push("❌ 访问失败: " + t.name + " — " + probeWhy(p));
+    if (p.ok && pp && pp.ok === false && (pp.fails || 0) >= cfg.debounce)
+      probeMsgs.push("✅ 访问恢复: " + t.name + " — HTTP " + (p.status || "?") + " · " + (p.ms || 0) + "ms");
+  }
+
+  let msgs = changed
+    .map((t) => (t.up ? "🟢 恢复在线: " : "🔴 已离线: ") + t.name)
+    .concat(degraded.map((t) => "🟠 隧道降级: " + t.name + " (部分连接器不可用)"))
+    .concat(probeMsgs);
+
+  // 免打扰: 静默期只记录, 结束后合并成一条摘要补发
+  const pend = await readState(env, "alert:pending");
+  const pendLines = ((pend && pend.items) || []).reduce((a, it) => a.concat(it.lines || []), []);
+  if (inQuiet(cfg, now)) {
+    if (msgs.length) {
+      const items = ((pend && pend.items) || []).concat([{ at: now, lines: msgs }]).slice(-40);
+      await storePut(env, "alert:pending", { items });
+      result.alert.quiet = true;
+      result.alert.deferred = msgs.length;
+    }
+    return result;
+  }
+  if (pendLines.length) {
+    msgs = ["🔕 免打扰期间累计 " + pendLines.length + " 条动态:"].concat(pendLines.slice(-20), [""], msgs);
+    await storePut(env, "alert:pending", { items: [] });
+  }
+  if (!msgs.length) return result;
   if (result.alert.paused) {
     result.alert.error = "推送已暂停" + (meta.paused.until ? ", 至 " + fmtT(meta.paused.until) : "");
     return result;
   }
   const targets = chatTargets(env, meta);
-  if (!targets.length) {
-    result.alert.error = "没有可用的 Telegram 接收者";
+  const useBark = barkReady(env, meta);
+  if (!targets.length && !useBark) {
+    result.alert.error = "没有可用的 Telegram 接收者, 也没配置 Bark";
     return result;
   }
-  const text = changed.map((t) => (t.up ? "🟢 恢复在线: " : "🔴 已离线: ") + t.name).join("\n") + "\n🕒 " + fmtT(now);
+  const text = msgs.join("\n") + "\n🕒 " + fmtT(now);
+  const errs = [];
   for (const id of targets) {
     const r = await tgSend(env, id, text, meta.botToken);
     if (r.ok) result.alert.sent++;
-    else result.alert.error = r.error;
+    else errs.push(r.error);
   }
+  if (useBark) {
+    const r = await barkSend(env, meta, text);
+    if (r.ok) result.alert.sent++;
+    else errs.push(r.error);
+  }
+  result.alert.channels = { tg: targets.length, bark: useBark };
+  if (errs.length) result.alert.error = errs[0];
   return result;
 }
 
@@ -631,9 +877,11 @@ const setCookie = (value, maxAge) =>
 
 // ---- API ----
 async function handleApi(request, env, path) {
+  try { env.__panelHost = new URL(request.url).host.toLowerCase(); } catch (e) {}
   const d = await request.json().catch(() => ({}));
   const uuid = (v) => UUID_RE.test(str(v));
-  // 前端在所有请求里带 acc (当前所选账号); 32 位 hex 才作为有效选择
+  // 前端在所有请求里带 acc (当前所选账号); 32 位 hex 才作为有效选择, "all" = 全部账户
+  const wantAll = str(d.acc) === "all";
   if (/^[0-9a-f]{32}$/i.test(str(d.acc))) env.cfAcc = str(d.acc).toLowerCase();
 
   // 登录 / 退出 (不需要已登录)
@@ -689,6 +937,46 @@ async function handleApi(request, env, path) {
       }
       if (!meta.botToken) return json({ error: "请填写 Bot Token (或配置环境变量 TG_BOT_TOKEN)" }, 400);
       if (!meta.chats.length) return json({ error: "请填写接收提醒的 chat_id" }, 400);
+      await saveMeta(env, meta);
+      return json(alertsPayload(env, meta));
+    }
+    if (str(d.action) === "cfg_save") {
+      requireKv(env);
+      const hm = (v, def) => (/^\d{2}:\d{2}$/.test(str(v)) ? str(v) : def);
+      meta.alertCfg = {
+        probe: d.probe !== false,
+        degraded: !!d.degraded,
+        debounce: Math.min(5, Math.max(1, parseInt(d.debounce, 10) || 2)),
+        quietOn: !!d.quietOn,
+        quietStart: hm(d.quietStart, "23:00"),
+        quietEnd: hm(d.quietEnd, "08:00"),
+        tz: 8,
+      };
+      await saveMeta(env, meta);
+      return json(alertsPayload(env, meta));
+    }
+    if (str(d.action) === "bark_save" || str(d.action) === "bark_test") {
+      requireKv(env);
+      const url = (str(d.url).trim() || BARK_DEFAULT).replace(/\/+$/, "");
+      const key = str(d.key).trim().replace(/[\s/]+/g, "");
+      if (!/^https?:\/\//i.test(url)) return json({ error: "Bark 服务器地址需以 http:// 或 https:// 开头" }, 400);
+      const oldKey = barkKey(env, meta);
+      const useKey = key || oldKey;
+      if (!useKey) return json({ error: "请填写 Bark 设备 key (App 首页复制)" }, 400);
+      const probe = { bark: { url, key: useKey } };
+      if (str(d.action) === "bark_test") {
+        // 用页面填写的配置发一条测试消息, 成功才返回 ok (不落存储)
+        const sent = await barkSend({ ...env, BARK_URL: "", BARK_KEY: "" }, probe, "✅ Cloudflare 隧道管理: Bark 提醒已连通");
+        if (!sent.ok) return json({ error: sent.error }, 400);
+        return json({ ...alertsPayload(env, meta), barkTested: true });
+      }
+      meta.bark = { url, key: useKey };
+      await saveMeta(env, meta);
+      return json(alertsPayload(env, meta));
+    }
+    if (str(d.action) === "bark_clear") {
+      requireKv(env);
+      meta.bark = { url: BARK_DEFAULT, key: "" };
       await saveMeta(env, meta);
       return json(alertsPayload(env, meta));
     }
@@ -805,38 +1093,42 @@ async function handleApi(request, env, path) {
     }
     if (action === "edit") {
       requireKv(env);
-      const accId = str(d.acc);
-      const row = meta.accounts.find((a) => str(a.acc) === accId);
-      if (!row) return json({ error: "账号不存在或为环境变量默认账号 (不可编辑)" }, 400);
-      const newName = str(d.name).trim().slice(0, 64);
-      const newAcc = str(d.newAcc);
-      const newToken = str(d.token);
-      // 名称: 填了就校验并更新; 留空保持原值
-      if (newName) {
-        if (!/[\p{L}\p{N}]/u.test(newName))
-          return json({ error: "账号名称需至少包含一个文字或数字 (不能全是标点符号)" }, 400);
-        row.name = newName;
-      }
-      // 账户 ID: 填了才改, 且不能与其他账号重复
+      const accId = str(d.acc).toLowerCase();
+      const cur = accountList(meta, env).find((a) => str(a.acc).toLowerCase() === accId);
+      if (!cur) return json({ error: "账号不存在" }, 400);
+      const name = str(d.name).trim().slice(0, 64);
+      const token = str(d.token).trim();
+      const newAcc = str(d.newAcc).trim();
+      if (!name && !token && !newAcc)
+        return json({ error: "没有要修改的内容 (名称、账户 ID 与 Token 都为空)" }, 400);
+      if (name && !/[\p{L}\p{N}]/u.test(name))
+        return json({ error: "账号名称需至少包含一个文字或数字" }, 400);
       if (newAcc) {
         if (!/^[0-9a-f]{32}$/i.test(newAcc)) return json({ error: "账户 ID 需为 32 位十六进制" }, 400);
+        if (cur.builtin) return json({ error: "环境变量默认账号的账户 ID 不可修改" }, 400);
         if (accountList(meta, env).some((a) => a.acc === newAcc && a.acc !== accId))
           return json({ error: "该账户 ID 已存在" }, 400);
       }
-      // Token: 填了才轮换; ID 或 Token 任一变更都要用(新)凭据验证
-      if (newAcc || newToken) {
+      // 换 Token / 换账户 ID 都要先用(新)凭据验证能拉到隧道, 通过才保存
+      if (token || newAcc) {
         const testAcc = newAcc || accId;
-        const testToken = newToken || row.token;
+        const testToken = token || cur.token;
         try {
           await cf({ cfToken: testToken, CF_API_TOKEN: testToken }, `/accounts/${testAcc}/cfd_tunnel?per_page=1`);
         } catch (e) {
-          return json({ error: "账号验证失败: " + (e && e.message) }, 400);
+          return json({ error: "Token 验证失败: " + (e && e.message) }, 400);
         }
-        if (newToken) row.token = newToken;
-        if (newAcc) {
-          row.acc = newAcc;
-          if (meta.curAcc === accId) meta.curAcc = newAcc;
-        }
+      }
+      meta.accNames = { ...(meta.accNames || {}) };
+      meta.accTokens = { ...(meta.accTokens || {}) };
+      if (name) meta.accNames[accId] = name;
+      if (token) meta.accTokens[accId] = token;
+      if (newAcc) {
+        const row = meta.accounts.find((a) => str(a.acc) === accId);
+        if (row) row.acc = newAcc;
+        if (meta.accNames[accId]) { meta.accNames[newAcc] = meta.accNames[accId]; delete meta.accNames[accId]; }
+        if (meta.accTokens[accId]) { meta.accTokens[newAcc] = meta.accTokens[accId]; delete meta.accTokens[accId]; }
+        if (meta.curAcc === accId) meta.curAcc = newAcc;
       }
       await saveMeta(env, meta);
       return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
@@ -847,13 +1139,17 @@ async function handleApi(request, env, path) {
       const builtin = accountList(meta, env).find((a) => a.acc === accId && a.builtin);
       if (builtin) return json({ error: "环境变量配置的默认账号不能删除" }, 400);
       meta.accounts = meta.accounts.filter((a) => str(a.acc) !== accId);
+      if (meta.accNames) delete meta.accNames[accId];
+      if (meta.accTokens) delete meta.accTokens[accId];
       if (meta.curAcc === accId) meta.curAcc = "";
       await saveMeta(env, meta);
       return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
     }
     if (action === "switch") {
       const accId = str(d.acc);
-      if (!accountList(meta, env).some((a) => a.acc === accId)) return json({ error: "账号不存在" }, 400);
+      // "all" = 全部账户 (面板默认视图), 不是真实账号, 不校验存在性
+      if (accId !== "all" && !accountList(meta, env).some((a) => a.acc === accId))
+        return json({ error: "账号不存在" }, 400);
       if (store(env)) {
         meta.curAcc = accId; // 记住上次选择, 下次打开面板默认用它
         await saveMeta(env, meta);
@@ -863,8 +1159,23 @@ async function handleApi(request, env, path) {
     return json({ error: "未知操作" }, 400);
   }
 
-  if (path === "/api/init")
-    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "" });
+  if (path === "/api/init") {
+    const service = env.DEFAULT_SERVICE || "";
+    if (!wantAll) {
+      const zs = await listZones(env);
+      const nm = actx && actx.name ? actx.name : acc;
+      return json({ zones: zs.map((z) => ({ ...z, acc, accName: nm })), service, cur: acc, envAcc: env.CF_ACCOUNT_ID || "" });
+    }
+    // 全部账户: 汇总所有账号的域名, 每个域名带上所属账号 (新建隧道时按所选域名路由到对应账号)
+    const zones = [];
+    for (const a of accountList(await getMeta(env), env)) {
+      try {
+        for (const z of await listZones({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc }))
+          zones.push({ ...z, acc: a.acc, accName: a.name });
+      } catch (e) {}
+    }
+    return json({ zones, service, cur: "all", envAcc: env.CF_ACCOUNT_ID || "" });
+  }
 
   if (path === "/api/create") {
     const name = str(d.name), service = str(d.service);
@@ -881,7 +1192,13 @@ async function handleApi(request, env, path) {
     );
   }
 
-  if (path === "/api/list") return json(await runChecks(env, await listTunnels(env, base)));
+  if (path === "/api/list") {
+    if (wantAll) return json(await listAllAccounts(env));
+    const r = await runChecks(env, await listTunnels(env, base));
+    // 每条隧道标注所属账号 (前端在"全部账户"视图里靠它路由操作)
+    r.tunnels = r.tunnels.map((t) => ({ ...t, acc, accName: actx && actx.name ? actx.name : acc }));
+    return json(r);
+  }
 
   if (path === "/api/alert") {
     requireKv(env);
@@ -1301,6 +1618,12 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .dot.healthy{background:var(--ok)}.dot.down{background:var(--bad)}.dot.degraded{background:var(--warn)}
 .badge{font-size:12px;padding:2px 9px;border-radius:10px;background:var(--in);color:var(--sub);flex:none}
 .badge.healthy{background:rgba(34,160,107,.14);color:var(--ok)}
+.badge.on{background:rgba(34,160,107,.14);color:var(--ok)}
+.pill.pok{color:var(--ok);border-color:rgba(34,160,107,.35)}
+.pill.pbad{color:var(--bad);border-color:rgba(229,72,77,.35)}
+.chk{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--text);cursor:pointer}
+.chk input[type=checkbox]{width:16px;height:16px;flex:none;padding:0;margin:0;accent-color:var(--ok)}
+.badge.off{background:var(--in);color:var(--sub)}
 .badge.degraded{background:rgba(232,163,23,.16);color:var(--warn)}
 .badge.down{background:rgba(217,63,63,.13);color:var(--bad)}
 .id{font-size:11px;color:var(--sub);margin:2px 0 0;word-break:break-all}
@@ -1327,10 +1650,14 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .rtable .rt .rh{flex:1;min-width:0;word-break:break-all}
 .rtable .rt .rh b{color:var(--text)}
 .rtable .rt .rs{color:var(--sub);flex:none;max-width:38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.delnote{margin:0 0 10px;font-size:13px;color:var(--sub);line-height:1.5}
+.delname{font-size:13px;background:var(--in);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:12px;word-break:break-all}
+.delname b{color:var(--fg);font-size:14px}
 .pill{font-size:11.5px;padding:3px 9px;border-radius:20px;background:var(--in);color:var(--sub);border:1px solid var(--line);white-space:nowrap}
 .pill.on{color:var(--ok);border-color:rgba(34,160,107,.4)}
 .pill.off{color:var(--bad);border-color:rgba(217,63,63,.35)}
 .pill.warn{color:var(--warn);border-color:rgba(232,163,23,.4)}
+.pill.accp{color:var(--pri);border-color:rgba(242,130,34,.35)}
 .empty{color:var(--sub);font-size:14px;text-align:center;padding:18px 0}
 .hint{font-size:13px;color:var(--sub);margin:2px 0 6px;line-height:1.65}
 .mask{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:8}
@@ -1396,7 +1723,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <nav class="nav">
       <a data-v="dash" class="on"><span class="i">📊</span>仪表板</a>
       <a data-v="tunnels"><span class="i">⚙️</span>Tunnel 管理</a>
-      <a data-v="tg"><span class="i">✈️</span>Telegram 配置</a>
+      <a data-v="tg"><span class="i">✈️</span>推送配置</a>
     </nav>
     <div class="foot"><a href="#" id="logout"><span class="i">👤</span><span class="lt">退出登录</span><span class="lo">⇥</span></a></div>
   </aside>
@@ -1444,7 +1771,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 
       <section class="view" id="v-tg">
         <div class="card">
-          <h3><span>Telegram 提醒</span><span class="pill" id="tg_state">-</span></h3>
+          <h3><span>Telegram 推送</span><span class="pill" id="tg_state">-</span></h3>
           <div class="row" style="align-items:flex-end">
             <div style="flex:1;min-width:0">
               <label for="tg_chat">接收者 chat_id</label>
@@ -1465,6 +1792,41 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         </div>
 
         <div class="card">
+          <h3><span>Bark 推送 (iOS)</span><span class="pill" id="bark_state">-</span></h3>
+          <div class="row" style="align-items:flex-end">
+            <div style="flex:1.2;min-width:0">
+              <label for="bark_url">服务器地址</label>
+              <input id="bark_url" placeholder="https://api.day.app" autocapitalize="off" autocomplete="off" spellcheck="false">
+            </div>
+            <div style="flex:1.6;min-width:0">
+              <label for="bark_key">设备 key</label>
+              <input id="bark_key" placeholder="App 首页那串 key" autocapitalize="off" autocomplete="off" spellcheck="false">
+            </div>
+            <button class="btn" id="bark_save" style="flex:none;padding:11px 18px;white-space:nowrap">保存 Bark</button>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn gray" id="bark_test" style="flex:none;width:96px">测试发送</button>
+          </div>
+          <div class="hint" style="margin-top:10px">iPhone 上装 Bark App, 在首页复制"设备"里的 key 填到上面即可 (服务器地址留空默认 <code>https://api.day.app</code>, 自建服务填自己的地址)。Bark 与 Telegram 相互独立, 两个渠道都配置时会同时推送; 提醒开关、暂停推送对两个渠道同时生效。</div>
+        </div>
+
+        <div class="card">
+          <h3><span>告警策略</span><span class="pill" id="cfg_state">-</span></h3>
+          <div class="row" style="gap:14px;flex-wrap:wrap">
+            <label class="chk"><input type="checkbox" id="cfg_probe"> 可用性探测</label>
+            <label class="chk"><input type="checkbox" id="cfg_degraded"> 降级也提醒</label>
+            <label class="chk"><input type="checkbox" id="cfg_quiet"> 免打扰</label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <div style="flex:.8;min-width:0"><label for="cfg_debounce">连续失败次数</label><input id="cfg_debounce" type="number" min="1" max="5" value="2" inputmode="numeric"></div>
+            <div style="flex:1;min-width:0"><label for="cfg_qs">免打扰开始</label><input id="cfg_qs" placeholder="23:00" inputmode="numeric"></div>
+            <div style="flex:1;min-width:0"><label for="cfg_qe">免打扰结束</label><input id="cfg_qe" placeholder="08:00" inputmode="numeric"></div>
+          </div>
+          <div class="btns" style="margin-top:12px"><button class="btn" id="cfg_save">保存策略</button></div>
+          <div class="hint" style="margin-top:10px">可用性探测会真实访问每条路由的域名(每 5 分钟一轮, 只看到状态码和耗时): 隧道正常但源站 502/超时也能发现。连续失败达到设定次数才推送, 避免抖动刷屏；免打扰期间只记录, 结束后合并成一条摘要补发。</div>
+        </div>
+
+        <div class="card">
           <h3>提醒规则</h3>
           <div class="hint">
             1. 每个隧道可在"Tunnel 管理"里单独开关上线/离线提醒, <strong>默认关闭</strong>, 需手动开启。<br>
@@ -1474,7 +1836,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
             (例如 <code>*/5 * * * *</code>), 代码里的 <code>scheduled</code> 处理会自动执行同样的检查。<br>
             5. Bot Token / 接收者 / 暂停状态都保存在 D1 (TUNNEL_DB) 或 KV (TUNNEL_STATE);
             也可用环境变量 <code>TG_BOT_TOKEN</code> 作为兜底 Token。<br>
-            6. 暂停推送期间状态仍照常检查和记录, 只是暂时不发送 Telegram 消息。
+            6. 暂停推送期间状态仍照常检查和记录, 只是暂时不发送 Telegram / Bark 消息。
           </div>
         </div>
       </section>
@@ -1544,8 +1906,27 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <label>该账户的 API Token (权限同环境变量要求)</label>
     <input id="am_token" placeholder="粘贴后点添加, 会先验证再保存" autocapitalize="off" autocomplete="off" spellcheck="false">
     <div class="btns" style="margin-top:12px"><button class="btn" id="am_add">添加账号</button></div>
-    <div class="hint" style="margin-top:8px">验证通过才保存; Token 只存在D1, 不会下发到页面。环境变量配置的"默认账号"不可删除。切换账号后隧道列表/提醒规则/域名随账号切换。</div>
+    <div class="hint" style="margin-top:8px">验证通过才保存; Token 只存在 D1, 不会下发到页面。任意账号 (含环境变量配置的"默认账号") 都可点<b>编辑</b>改名或换 Token, 改完立即生效; 只有"默认账号"不可删除。</div>
   </div>
+</div>
+
+<div class="modal" id="mDel">
+  <h3><span class="wi">⚠</span><span>删除隧道</span><button class="x" id="d_x">✕</button></h3>
+  <p class="delnote">将删除该隧道及其全部 DNS 路由, <b>无法撤销</b>。</p>
+  <div class="delname">隧道名称：<b id="d_name"></b></div>
+  <label for="d_input">请输入上方隧道名称以确认 <span class="amhint">(区分大小写)</span></label>
+  <input id="d_input" placeholder="在此输入隧道名称" autocapitalize="off" autocomplete="off" spellcheck="false">
+  <div class="btns"><button class="btn gray" id="d_no">取消</button><button class="btn red-solid danger" id="d_yes" disabled>删除</button></div>
+</div>
+
+<div class="modal" id="mAccEdit">
+  <h3><span>编辑账号</span><button class="x" id="ae_x">✕</button></h3>
+  <div class="hint" id="ae_acc" style="margin-bottom:10px;word-break:break-all"></div>
+  <label>账号名称 <span class="amhint">(显示在下拉框和列表里)</span></label>
+  <input id="ae_name" placeholder="例如 主账号 / admin@x.com" autocomplete="off">
+  <label>API Token <span class="amhint">(留空则不修改)</span></label>
+  <input id="ae_token" placeholder="留空则不修改" autocapitalize="off" autocomplete="off" spellcheck="false">
+  <div class="btns"><button class="btn gray" id="ae_cancel">取消</button><button class="btn" id="ae_save">保存</button></div>
 </div>
 
 <div class="mask" id="c_mask"></div>
@@ -1599,7 +1980,7 @@ async function api(path,extra){
   var r,d;
   // 自动携带当前所选账号 (/api/acc 自身除外, 避免循环依赖)
   var body=extra||{};
-  if(path!=='/api/acc'&&curAcc)body.acc=curAcc;
+  if(path!=='/api/acc'&&curAcc&&!body.acc)body.acc=curAcc;
   try{r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
   catch(e){throw new Error('网络请求失败, 请检查网络后重试')}
   try{d=await r.json()}catch(e){throw new Error('服务返回异常 (HTTP '+r.status+')')}
@@ -1665,20 +2046,51 @@ $('c_no').onclick=function(){settleConfirm(false)};
 $('c_mask').onclick=function(){settleConfirm(false)};
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'&&cResolve)settleConfirm(false);
+  if(e.key==='Escape'&&dResolve)settleName(false);
   if(e.key==='Enter'&&cResolve){e.preventDefault();settleConfirm(true)}
 });
 
+/* ---- 删除隧道: 必须手输隧道名称 ---- */
+var dResolve=null,dNeed='';
+function askName(name){
+  dNeed=String(name||'');
+  $('d_name').textContent=dNeed||'(未知名称)';
+  $('d_input').value='';
+  $('d_yes').disabled=true;
+  openModal('mDel');
+  setTimeout(function(){$('d_input').focus()},60);
+  return new Promise(function(res){dResolve=res});
+}
+function settleName(v){
+  if(dResolve){var r=dResolve;dResolve=null;r(v)}
+  closeModal();
+}
+$('d_input').addEventListener('input',function(){
+  $('d_yes').disabled=this.value.trim()!==dNeed.trim();
+});
+$('d_input').addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&this.value.trim()===dNeed.trim()){e.preventDefault();settleName(true)}
+});
+$('d_yes').onclick=function(){
+  if($('d_input').value.trim()!==dNeed.trim())return;
+  settleName(true);
+};
+$('d_no').onclick=function(){settleName(false)};
+$('d_x').onclick=function(){settleName(false)};
+
 /* ---- 菜单 ---- */
 /* ---- 多账号 ---- */
-var curAcc='',accNames={},envAccId='';
+var curAcc='all',accNames={},envAccId='';
 function renderAccSel(d){
   // d: /api/acc list 的返回 {accounts:[{name,acc,builtin}], cur}
-  if(d&&d.cur)curAcc=d.cur;
+  // 默认视图是"全部账户": 不在打开面板时恢复上次选的单账号
   var list=(d&&d.accounts)||[];
   list.forEach(function(a){accNames[a.acc]=a.name});
-  $('acc_sel').innerHTML=list.map(function(a){
-    return '<option value="'+esc(a.acc)+'"'+(a.acc===curAcc?' selected':'')+'>'+esc(a.name)+'</option>';
-  }).join('');
+  if(curAcc!=='all'&&!list.some(function(a){return a.acc===curAcc}))curAcc='all';
+  $('acc_sel').innerHTML='<option value="all"'+(curAcc==='all'?' selected':'')+'>全部账户</option>'+
+    list.map(function(a){
+      return '<option value="'+esc(a.acc)+'"'+(a.acc===curAcc?' selected':'')+'>'+esc(a.name)+'</option>';
+    }).join('');
 }
 async function loadAccs(){
   try{
@@ -1689,18 +2101,6 @@ async function loadAccs(){
       curAcc=envAccId;accNames[envAccId]='默认账号';
       $('acc_sel').innerHTML='<option value="'+esc(envAccId)+'" selected>默认账号</option>';
     }else $('acc_sel').innerHTML='<option value="">默认账号</option>';
-  }
-}
-async function initZones(){
-  try{
-    var d=await api('/api/init');
-    if(d.envAcc)envAccId=d.envAcc;
-    $('zone').innerHTML=d.zones.length?d.zones.map(function(z){return '<option value="'+esc(z.id)+'">.'+esc(z.name)+'</option>'}).join(''):'<option value="">无可用域名</option>';
-    if(d.service)$('svc').value=d.service;
-    preview();
-  }catch(e){
-    $('zone').innerHTML='<option value="">加载失败</option>';
-    fail(e);
   }
 }
 $('acc_sel').addEventListener('change',async function(){
@@ -1717,61 +2117,53 @@ $('acc_sel').addEventListener('change',async function(){
   loadMeta();
 });
 $('acc_mgr').onclick=function(){openAccMgr()};
-// 账号管理弹窗列表渲染 (含编辑按钮); items: [{name,acc,builtin}]
-function amRender(items){
-  accNames={};
-  $('am_body').innerHTML=items.map(function(a){
-    accNames[a.acc]=a.name;
-    return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-      '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
-      (a.builtin?'':'<div style="display:flex;gap:6px;flex:none">'+
-        '<button class="btn sm" data-amedit="'+esc(a.acc)+'" data-amname="'+esc(a.name)+'">编辑</button>'+
-        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button></div>')+
-      '</div>';
-  }).join('')||'<div class="empty">暂无添加的账号</div>';
+function accRowHtml(a){
+  return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
+    '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+    '<div style="display:flex;gap:6px;flex:none">'+
+      '<button class="btn sm" data-amedit="'+esc(a.acc)+'" data-amname="'+esc(a.name)+'" data-ambuiltin="'+(a.builtin?1:'')+'">编辑</button>'+
+      (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+    '</div></div>';
 }
-// 点"编辑"在该账号卡片下展开内联编辑表单; 留空的字段保持原值不变
-document.addEventListener('click',function(e){
-  var t=e.target.closest('[data-amedit]');if(!t)return;
-  document.querySelectorAll('.am-edit').forEach(function(x){x.remove()}); // 同时只展开一个
-  var acc=t.dataset.amedit,orig=t.dataset.amname;
-  var div=document.createElement('div');
-  div.className='am-edit';
-  div.innerHTML=
-    '<label style="margin-top:10px">账号名称 (留空保持不变)</label>'+
-    '<input id="ame_name" placeholder="当前: '+esc(orig)+'" autocomplete="off">'+
-    '<label>账户 ID (留空保持不变)</label>'+
-    '<input id="ame_acc" placeholder="当前: '+esc(acc)+'" autocapitalize="off" autocomplete="off" spellcheck="false">'+
-    '<label>API Token (留空保持不变; 换新 Token 会先验证)</label>'+
-    '<input id="ame_token" placeholder="粘贴新 Token" autocapitalize="off" autocomplete="off" spellcheck="false">'+
-    '<div style="display:flex;gap:8px;margin-top:10px">'+
-      '<button class="btn gray" id="ame_cancel" style="flex:1">取消</button>'+
-      '<button class="btn" id="ame_save" style="flex:1">保存</button>'+
-    '</div>';
-  t.closest('.am-item').after(div);
-  $('ame_cancel').onclick=function(){div.remove()};
-  $('ame_save').onclick=async function(){
-    var sb=this;
-    sb.disabled=true;sb.innerHTML='<span class="spin"></span> 保存中';
-    try{
-      var d=await api('/api/acc',{action:'edit',acc:acc,
-        name:$('ame_name').value.trim(),newAcc:$('ame_acc').value.trim(),token:$('ame_token').value.trim()});
-      toast('账号已更新');
-      amRender(d.accounts||[]);
-      renderAccSel({accounts:d.accounts||[],cur:curAcc});
-    }catch(e){fail(e)}
-    sb.disabled=false;sb.innerHTML='保存';
-  };
-});
+function renderAccList(items){
+  accNames={};
+  items.forEach(function(a){accNames[a.acc]=a.name});
+  $('am_body').innerHTML=items.map(accRowHtml).join('')||'<div class="empty">暂无添加的账号</div>';
+  renderAccSel({accounts:items,cur:curAcc});
+}
 async function openAccMgr(){
   var b=$('am_body');
   b.innerHTML='<div class="empty">加载中...</div>';
   openModal('mAccMgr');
   try{
     var d=await api('/api/acc',{action:'list'});
-    amRender(d.accounts||[]);
+    renderAccList(d.accounts||[]);
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
+var aeAcc='';
+function openAccEdit(name,acc,builtin){
+  aeAcc=acc;
+  $('ae_acc').textContent=acc+(builtin?' · 环境变量默认账号 (Token 可覆盖)':'');
+  $('ae_name').value=name||'';
+  $('ae_token').value='';
+  $('ae_token').placeholder='留空则不修改';
+  openModal('mAccEdit');
+  setTimeout(function(){$('ae_name').focus()},60);
+}
+$('ae_x').onclick=closeModal;$('ae_cancel').onclick=closeModal;
+$('ae_save').onclick=async function(){
+  var b=this, name=$('ae_name').value.trim(), token=$('ae_token').value.trim();
+  if(!name&&!token){toast('名称和 Token 至少改一项','err');return}
+  b.disabled=true;b.innerHTML='<span class="spin"></span> 保存中';
+  try{
+    var d=await api('/api/acc',{action:'edit',acc:aeAcc,name:name,token:token});
+    closeModal();
+    toast('账号已更新');
+    renderAccList(d.accounts||[]);
+    loadTg();initZones();loadList().then(loadMeta);
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='保存';
+};
 $('am_add').onclick=async function(){
   var b=this,name=$('am_name').value.trim(),acc=$('am_acc').value.trim(),token=$('am_token').value.trim();
   if(!name||!acc||!token){toast('请填写名称、账户 ID 和 API Token','err');return}
@@ -1780,39 +2172,39 @@ $('am_add').onclick=async function(){
     var d=await api('/api/acc',{action:'add',name:name,acc:acc,token:token});
     $('am_name').value='';$('am_acc').value='';$('am_token').value='';
     toast('账号已添加: '+name);
-    amRender(d.accounts||[]);
-    renderAccSel({accounts:d.accounts||[],cur:curAcc});
+    renderAccList(d.accounts||[]);
   }catch(e){fail(e)}
   b.disabled=false;b.innerHTML='添加账号';
 };
 document.addEventListener('click',async function(e){
+  var ed=e.target.closest('[data-amedit]');
+  if(ed){openAccEdit(ed.dataset.amname,ed.dataset.amedit,ed.dataset.ambuiltin==='1');return}
   var t=e.target.closest('[data-amdel]');if(!t)return;
   if(!(await askConfirm('删除该账号? 仅移出面板, 不影响 Cloudflare 账户本身','删除账号','删除')))return;
   try{
     var d=await api('/api/acc',{action:'del',acc:t.dataset.amdel});
     toast('已删除');
     var items=d.accounts||[];
-    amRender(items);
     // 删除的是当前账号 (或其已不存在) → 自动切回默认账号 (env 账号), 重新加载列表/域名/提醒
     if(curAcc===t.dataset.amdel||!items.some(function(a){return a.acc===curAcc})){
       var fallback=items.find(function(a){return a.builtin})||items[0];
       if(fallback){
         curAcc=fallback.acc;
         try{await api('/api/acc',{action:'switch',acc:curAcc})}catch(e2){}
-        renderAccSel({accounts:items,cur:curAcc});
+        renderAccList(items);
         setBusy(true,'账号切换中...');
         try{metaCache={};await Promise.all([loadList(),initZones()])}finally{setBusy(false)}
         loadTg();loadMeta();
       }
     }else{
-      renderAccSel({accounts:items,cur:curAcc});
+      renderAccList(items);
     }
   }catch(e){fail(e)}
 });
 function show(v){
   document.querySelectorAll('.nav a').forEach(function(a){a.className=a.dataset.v===v?'on':''});
   document.querySelectorAll('.view').forEach(function(s){s.className='view'+(s.id==='v-'+v?' on':'')});
-  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',tg:'Telegram 配置'})[v]||'';
+  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',tg:'推送配置'})[v]||'';
   $('sidenav').className='sidenav';
 }
 document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v)}});
@@ -1825,7 +2217,7 @@ $('logout').onclick=async function(e){
 document.querySelectorAll('.view').forEach(function(s){s.addEventListener('click',function(){$('sidenav').className='sidenav'})});
 
 /* ---- 仪表板 ---- */
-var stText={healthy:'在线',degraded:'降级',down:'离线',inactive:'未启用'};
+var stText={healthy:'正常',degraded:'降级',down:'断连',inactive:'未启用'};
 function durShort(ms){
   var m=Math.floor(ms/60000);
   if(m<1)return '<1m';
@@ -1845,13 +2237,16 @@ function renderDash(d){
   box.innerHTML=d.tunnels.map(function(t){
     return '<div class="item"><div class="top"><span class="dot '+esc(t.status)+'"></span>'+
       '<span class="nm">'+esc(t.name)+'</span>'+
+      (t.accName?'<span class="pill accp" title="所属账户">'+esc(t.accName)+'</span>':'')+
+      '<span class="badge '+(t.up?'on':'off')+'">'+(t.up?'在线':'离线')+'</span>'+
+      probePill(t)+
       '<span class="badge '+esc(t.status)+'">'+esc(stText[t.status]||t.status)+'</span></div>'+
       '<div class="id">'+esc(t.id)+'</div></div>';
   }).join('');
 }
 
 /* ---- 隧道列表 + 搜索 ---- */
-var allTunnels=[],allAlertOn={},metaCache={},upTs={};
+var allTunnels=[],allAlertOn={},metaCache={},upTs={},probeMap={};
 function setSum(d){
   $('sum').innerHTML='共 <b>'+d.total+'</b> · 在线 <b>'+d.online+'</b> · 离线 <b>'+d.offline+'</b>';
 }
@@ -1870,8 +2265,10 @@ function renderList(){
   l.innerHTML=arr.map(function(t){
     var on=allAlertOn[t.id]===true,m=metaCache[t.id]||{};
     // 在线徽章附带运行时长 (随 /api/list 的 conns_active_at 下发, 实时计算)
-    var badgeTxt=stText[t.status]||t.status;
-    if(t.status==='healthy'&&upTs[t.id])badgeTxt+=' '+durShort(Date.now()-upTs[t.id]);
+    // 在线徽章 = 是否连通 (healthy/degraded 都算连通); 另用独立徽章显示隧道状态 (正常/降级/断连)
+    var badgeTxt=(t.up?'在线':'离线');
+    if(t.up&&upTs[t.id])badgeTxt+=' '+durShort(Date.now()-upTs[t.id]);
+    var stTxt=stText[t.status]||t.status||'未知';
     var rules=(m.routes&&m.routes.length?m.routes:(m.hostname?[{hostname:m.hostname,path:m.path||'',service:m.service||''}]:[]));
     // routes===null 表示还没拉到或拉取失败, 显示"加载中"而不是误导性的"未配置域名"
     var routeLines=(m.routes===null&&(!rules||!rules.length))
@@ -1885,15 +2282,18 @@ function renderList(){
       '<span class="dot '+esc(t.status)+'"></span>'+
       '<span class="nm" title="'+esc(t.name)+'">'+esc(t.name)+'</span>'+
       '<span class="id" title="'+esc(t.id)+'">'+esc(t.id)+'</span>'+
+      (t.accName?'<span class="pill accp" title="所属账户">'+esc(t.accName)+'</span>':'')+
+      '<span class="badge '+esc(t.status)+'" title="Cloudflare 上报的隧道状态">'+esc(stTxt)+'</span>'+
+      probePill(t)+
       '<span class="pill">'+nRoutes+' 条路由</span>'+
       '<div class="acts">'+
-      '<button class="btn sm" data-act="tk" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">🔑</span><span class="btxt">Token</span></button>'+
-      '<button class="btn sm" data-act="route" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">🌐</span><span class="btxt">路由</span></button>'+
-      '<button class="btn sm" data-act="edit" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">✏️</span><span class="btxt">编辑</span></button>'+
-      '<button class="btn sm" data-act="alert" data-id="'+esc(t.id)+'" data-up="'+(t.up?1:0)+'" data-on="'+(on?1:0)+'">'+(on?'🔔':'🔕')+'<span class="btxt">'+(on?'提醒开':'提醒关')+'</span></button>'+
-      '<button class="btn sm red" data-act="del" data-id="'+esc(t.id)+'"><span class="bico">🗑</span><span class="btxt">删除</span></button>'+
+      '<button class="btn sm" data-act="tk" data-acc="'+esc(t.acc||'')+'" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">🔑</span><span class="btxt">Token</span></button>'+
+      '<button class="btn sm" data-act="route" data-acc="'+esc(t.acc||'')+'" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">🌐</span><span class="btxt">路由</span></button>'+
+      '<button class="btn sm" data-act="edit" data-acc="'+esc(t.acc||'')+'" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">✏️</span><span class="btxt">编辑</span></button>'+
+      '<button class="btn sm" data-act="alert" data-acc="'+esc(t.acc||'')+'" data-id="'+esc(t.id)+'" data-up="'+(t.up?1:0)+'" data-on="'+(on?1:0)+'">'+(on?'🔔':'🔕')+'<span class="btxt">'+(on?'提醒开':'提醒关')+'</span></button>'+
+      '<button class="btn sm red" data-act="del" data-acc="'+esc(t.acc||'')+'" data-id="'+esc(t.id)+'" data-name="'+esc(t.name)+'"><span class="bico">🗑</span><span class="btxt">删除</span></button>'+
       '</div>'+
-      '<span class="badge '+esc(t.status)+'" style="position:absolute;right:0;top:50%;transform:translateY(-50%)" title="'+(upTs[t.id]?'自 '+new Date(upTs[t.id]).toLocaleString():'')+'">'+esc(badgeTxt)+'</span>'+
+      '<span class="badge '+(t.up?'on':'off')+'" style="position:absolute;right:0;top:50%;transform:translateY(-50%)" title="'+(upTs[t.id]?'自 '+new Date(upTs[t.id]).toLocaleString():'')+'">'+esc(badgeTxt)+'</span>'+
       '</div>'+
       '<div class="routes">'+routeLines+'</div></div>';
   }).join('');
@@ -1916,6 +2316,7 @@ async function loadList(){
   try{
     var d=await api('/api/list');
     allTunnels=d.tunnels||[];allAlertOn=d.alertOn||{};
+    probeMap=d.probes||{};
     upTs={};(d.tunnels||[]).forEach(function(t){if(t.since)upTs[t.id]=t.since});
     setSum(d);renderDash(d);renderList();
   }catch(e){$('sum').innerHTML='';l.innerHTML='<div class="empty">加载失败</div>';fail(e)}
@@ -1925,7 +2326,7 @@ async function loadMeta(){
   for (var i=0;i<allTunnels.length;i+=6){
     await Promise.all(allTunnels.slice(i,i+6).map(async function(t){
       try{
-        var r=await api('/api/detail',{id:t.id});
+        var r=await api('/api/detail',{id:t.id,acc:t.acc||''});
         metaCache[t.id]={hostname:(r.rules&&r.rules[0]&&r.rules[0].hostname)||'',path:(r.rules&&r.rules[0]&&r.rules[0].path)||'',service:(r.rules&&r.rules[0]&&r.rules[0].service)||r.service||'',routes:r.rules||[]};
       }catch(e){
         // 拉取失败 (限流等): 保留上次结果, 不当作"未配置域名"
@@ -1942,19 +2343,19 @@ async function loadMeta(){
 document.addEventListener('click',function(e){
   var t=e.target.closest('[data-copy],[data-act]');if(!t)return;
   if(t.dataset.copy!==undefined){copy(t.dataset.copy);return}
-  var id=t.dataset.id;
-  if(t.dataset.act==='tk')showTk(id,t.dataset.name);
-  if(t.dataset.act==='route')openRoutes(id,t.dataset.name);
-  if(t.dataset.act==='edit')openEdit(id,t.dataset.name);
-  if(t.dataset.act==='del')del(id);
-  if(t.dataset.act==='alert')toggleAlert(id,t.dataset.on==='1',t.dataset.up==='1');
+  var id=t.dataset.id,ta=t.dataset.acc||'';
+  if(t.dataset.act==='tk')showTk(id,t.dataset.name,ta);
+  if(t.dataset.act==='route')openRoutes(id,t.dataset.name,ta);
+  if(t.dataset.act==='edit')openEdit(id,t.dataset.name,ta);
+  if(t.dataset.act==='del')del(id,t.dataset.name,ta);
+  if(t.dataset.act==='alert')toggleAlert(id,t.dataset.on==='1',t.dataset.up==='1',ta);
   if(t.dataset.act==='rmchat')rmChat(t.dataset.chat);
   if(t.dataset.act==='rmdel')rmRoute(t.dataset.host,t.dataset.path);
 });
 
-async function toggleAlert(id,on,up){
+async function toggleAlert(id,on,up,acc){
   try{
-    var d=await api('/api/alert',{id:id,action:'toggle',on:!on,up:up});
+    var d=await api('/api/alert',{id:id,action:'toggle',on:!on,up:up,acc:acc||''});
     allAlertOn[id]=!!d.on;renderList();
     toast(d.on?'已开启该隧道的提醒':'已关闭该隧道的提醒');
   }catch(e){
@@ -1976,10 +2377,29 @@ var subDirty=false;
 $('name').addEventListener('input',function(){if(!subDirty){$('sub').value=$('name').value;preview()}});
 $('sub').addEventListener('input',function(){var v=$('sub').value;subDirty=v!==''&&v!==$('name').value});
 
+var zoneList=[];
+// 域名下拉: "全部账户"时按账号分组, 指定账号时只显示该账号的域名
+function zoneHtml(onlyAcc){
+  var zs=zoneList.filter(function(z){return !onlyAcc||!z.acc||z.acc===onlyAcc});
+  if(!zs.length)return '<option value="">无可用域名</option>';
+  var groups={},order=[];
+  zs.forEach(function(z){var k=z.accName||'';if(!groups[k]){groups[k]=[];order.push(k)}groups[k].push(z)});
+  var multi=order.filter(function(k){return !!k}).length>1;
+  return order.map(function(k){
+    var opts=groups[k].map(function(z){return '<option value="'+esc(z.id)+'">.'+esc(z.name)+'</option>'}).join('');
+    return multi&&k?'<optgroup label="'+esc(k)+'">'+opts+'</optgroup>':opts;
+  }).join('');
+}
+function zoneAccOf(id){
+  var z=zoneList.filter(function(x){return x.id===id})[0];
+  return z&&z.acc?z.acc:'';
+}
 async function initZones(){
   try{
     var d=await api('/api/init');
-    $('zone').innerHTML=d.zones.length?d.zones.map(function(z){return '<option value="'+esc(z.id)+'">.'+esc(z.name)+'</option>'}).join(''):'<option value="">无可用域名</option>';
+    if(d.envAcc)envAccId=d.envAcc;
+    zoneList=d.zones||[];
+    $('zone').innerHTML=zoneHtml('');
     if(d.service)$('svc').value=d.service;
     preview();
   }catch(e){
@@ -1999,7 +2419,7 @@ $('go').onclick=async function(){
   if(!$('svc').value.trim()){toast('请填写本地服务地址','err');return}
   b.disabled=true;b.innerHTML='<span class="spin"></span> 创建中';
   try{
-    var d=await api('/api/create',{name:$('name').value.trim(),zoneId:$('zone').value,sub:$('sub').value.trim(),path:$('path').value.trim(),service:$('svc').value.trim()});
+    var d=await api('/api/create',{name:$('name').value.trim(),zoneId:$('zone').value,sub:$('sub').value.trim(),path:$('path').value.trim(),service:$('svc').value.trim(),acc:zoneAccOf($('zone').value)||curAcc});
     closeModal();
     toast('隧道 '+d.name+' 创建成功');
     // 重置表单
@@ -2028,22 +2448,24 @@ function showToken(r,token,fresh){
   $('t_body').innerHTML=cmds(token);
   openModal('mToken');
 }
-async function showTk(id,name){
+var tkAcc='';
+async function showTk(id,name,acc){
+  tkAcc=acc||'';
   openModal('mToken');
   $('t_banner').innerHTML='';
   $('t_body').innerHTML='<div class="empty">加载中...</div>';
   try{
-    var res=await Promise.all([api('/api/token',{id:id}),api('/api/detail',{id:id}).catch(function(){return null})]);
+    var res=await Promise.all([api('/api/token',{id:id,acc:tkAcc}),api('/api/detail',{id:id,acc:tkAcc}).catch(function(){return null})]);
     var det=res[1]||{};
     var rules=det.rules||[];
     showToken({name:name,id:id,rules:rules,hostname:rules[0]?rules[0].hostname:'',path:rules[0]?(rules[0].path||''):'',service:det.service||''},res[0].token,false);
   }catch(e){$('t_body').innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
-async function del(id){
-  if(!(await askConfirm('确定删除该隧道?\\n将同时删除对应的 DNS 记录。','删除隧道','删除')))return;
+async function del(id,name,acc){
+  if(!(await askName(name)))return;
   setBusy(true,'删除tunnel和dns中...');
   try{
-    var d=await api('/api/delete',{id:id});
+    var d=await api('/api/delete',{id:id,acc:acc||''});
     toast(d.dnsFailed?'隧道已删除, 但 DNS 记录清理失败: '+(d.dnsErr||'请到 DNS 页面手动删除'):(d.dns?'已删除隧道和 '+d.dns+' 条 DNS 记录':'已删除隧道'));
     loadList().then(loadMeta);
   }catch(e){fail(e)}
@@ -2064,16 +2486,17 @@ function ePreview(){
   if(!z){$('e_pv').innerHTML='';return}
   $('e_pv').innerHTML='<b>'+esc(sub?sub+'.'+z:z)+'</b>'+(p?' · 路径 '+esc(p):'')+' → '+esc(s||'(未填写本地服务)');
 }
-async function openEdit(id,name){
-  editId=id;editOld=name;editRules=[];editSel=0;
+var editAcc='';
+async function openEdit(id,name,acc){
+  editId=id;editOld=name;editRules=[];editSel=0;editAcc=acc||'';
   $('e_name').value=name;$('e_sub').value='';$('e_path').value='';$('e_svc').value='';
   $('e_pick').innerHTML='';$('e_pick_wrap').style.display='none';
   $('e_note').innerHTML='读取配置中...';
-  $('e_zone').innerHTML=$('zone').innerHTML;
+  $('e_zone').innerHTML=zoneHtml(editAcc);
   $('e_save').disabled=true;
   openModal('mEdit');
   try{
-    var d=await api('/api/detail',{id:id});
+    var d=await api('/api/detail',{id:id,acc:editAcc});
     editRules=d.rules||[];
     var note='';
     if(editRules.length>1){
@@ -2104,7 +2527,7 @@ async function saveEdit(){
     var sel=editRules.length>1?editRules[$('e_pick').selectedIndex]:editRules[0];
     var d=await api('/api/update',{id:editId,name:name!==editOld?name:'',zoneId:$('e_zone').value,
       sub:$('e_sub').value.trim(),path:$('e_path').value.trim(),service:$('e_svc').value.trim(),
-      host:sel&&sel.hostname||'',oldPath:sel&&sel.path||''});
+      host:sel&&sel.hostname||'',oldPath:sel&&sel.path||'',acc:editAcc});
     closeModal();
     toast(d.dnsFailed?'已保存, 但旧 DNS 记录清理失败: '+(d.dnsErr||'请手动删除'):'修改已保存');
     loadList().then(loadMeta);
@@ -2135,15 +2558,16 @@ function rPreview(){
   $('r_pv').innerHTML='<b>'+esc(sub?sub+'.'+z:z)+'</b>'+(p?' · 路径 '+esc(p):'')+' → '+esc(s||'(未填写本地服务)');
 }
 ['r_sub','r_zone','r_path','r_svc'].forEach(function(i){$(i).addEventListener('input',rPreview);$(i).addEventListener('change',rPreview)});
-async function openRoutes(id,name){
-  routeId=id;
+var routeAcc='';
+async function openRoutes(id,name,acc){
+  routeId=id;routeAcc=acc||'';
   $('r_name').textContent=name||'';
   $('r_sub').value='';$('r_path').value='';$('r_svc').value='';$('r_pv').innerHTML='';
-  $('r_zone').innerHTML=$('zone').innerHTML;
+  $('r_zone').innerHTML=zoneHtml(routeAcc);
   $('r_list').innerHTML='<div class="empty">加载中...</div>';
   openModal('mRoutes');
   try{
-    var d=await api('/api/route',{id:id,action:'list'});
+    var d=await api('/api/route',{id:id,action:'list',acc:routeAcc});
     renderRoutes(d.rules);
   }catch(e){$('r_list').innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
@@ -2151,7 +2575,7 @@ $('r_x').onclick=closeModal;$('r_cancel').onclick=closeModal;
 async function rmRoute(host,path){
   if(!(await askConfirm('删除路由 '+host+(path||'')+' ?\\n若没有其他路由使用该域名, 对应的 DNS 记录也会一并删除。','删除路由','删除')))return;
   try{
-    var d=await api('/api/route',{id:routeId,action:'del',hostname:host,path:path});
+    var d=await api('/api/route',{id:routeId,action:'del',hostname:host,path:path,acc:routeAcc});
     renderRoutes(d.rules);
     toast(d.dnsFailed?'路由已删除, 但 DNS 清理失败: '+(d.dnsErr||'请手动删除'):'路由已删除');
     loadList().then(loadMeta);
@@ -2164,7 +2588,7 @@ $('r_add').onclick=async function(){
   b.disabled=true;b.innerHTML='<span class="spin"></span> 添加中';
   try{
     var d=await api('/api/route',{id:routeId,action:'add',zoneId:$('r_zone').value,
-      sub:$('r_sub').value.trim(),path:$('r_path').value.trim(),service:$('r_svc').value.trim()});
+      sub:$('r_sub').value.trim(),path:$('r_path').value.trim(),service:$('r_svc').value.trim(),acc:routeAcc});
     renderRoutes(d.rules);
     $('r_sub').value='';$('r_path').value='';$('r_pv').innerHTML='';
     toast('路由已添加, DNS 已同步');
@@ -2175,6 +2599,8 @@ $('r_add').onclick=async function(){
 
 /* ---- Telegram ---- */
 function renderTg(d){
+  renderCfg(d);
+  renderBark(d);
   var pill=$('tg_state');
   if(!d.kv){pill.className='pill warn';pill.textContent='未绑定 KV'}
   else if(d.paused){pill.className='pill warn';pill.textContent='推送已暂停'}
@@ -2239,6 +2665,69 @@ async function rmChat(chat){
   if(!(await askConfirm('移除接收者 '+chat+' ?','移除接收者','移除')))return;
   try{renderTg(await api('/api/tg',{action:'remove',chat:chat}));toast('已移除接收者')}catch(e){fail(e)}
 }
+
+/* ---- 告警策略 / 可用性探测 ---- */
+function renderCfg(d){
+  var c=d.cfg||{};
+  $('cfg_probe').checked=c.probe!==false;
+  $('cfg_degraded').checked=!!c.degraded;
+  $('cfg_quiet').checked=!!c.quietOn;
+  $('cfg_debounce').value=c.debounce||2;
+  $('cfg_qs').value=c.quietStart||'23:00';
+  $('cfg_qe').value=c.quietEnd||'08:00';
+  var p=$('cfg_state');
+  if(c.probe===false){p.className='pill warn';p.textContent='探测关闭';return}
+  var txt='连续 '+(c.debounce||2)+' 次失败才提醒';
+  if(c.quietOn)txt+=' · 静默 '+c.quietStart+'-'+c.quietEnd;
+  if(c.degraded)txt+=' · 含降级';
+  p.className='pill on';p.textContent=txt;
+}
+$('cfg_save').onclick=async function(){
+  var b=this;b.disabled=true;b.innerHTML='<span class="spin"></span> 保存中';
+  try{
+    var d=await api('/api/tg',{action:'cfg_save',
+      probe:$('cfg_probe').checked,degraded:$('cfg_degraded').checked,
+      debounce:+$('cfg_debounce').value||2,quietOn:$('cfg_quiet').checked,
+      quietStart:$('cfg_qs').value.trim(),quietEnd:$('cfg_qe').value.trim()});
+    renderTg(d);toast('告警策略已保存');loadList();
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='保存策略';
+};
+// 探测徽章: ✓ 128ms / ✗ 超时
+function probePill(t){
+  var p=probeMap[t.id];
+  if(!p||p.skipped||p.ok===null||p.ok===undefined)return '';
+  var tip=(p.hosts||[]).map(function(x){return x.host+' → '+(x.err||('HTTP '+x.status))+' '+x.ms+'ms'}).join(' | ');
+  return '<span class="pill '+(p.ok?'pok':'pbad')+'" title="'+esc(tip||'')+'">'+(p.ok?(p.status+' · '+(p.ms||0)+'ms'):'✗ '+esc(p.err||('HTTP '+p.status)))+'</span>';
+}
+
+/* ---- Bark 推送 ---- */
+function renderBark(d){
+  var b=d.bark||{},pill=$('bark_state');
+  if(!d.kv){pill.className='pill warn';pill.textContent='未绑定存储'}
+  else if(b.has){pill.className='pill on';pill.textContent='已配置'}
+  else{pill.className='pill off';pill.textContent='未配置'}
+  if(b.url&&!$('bark_url').value)$('bark_url').value=b.url;
+  if(b.keyMask&&!$('bark_key').value)$('bark_key').placeholder='已保存 '+b.keyMask+' (留空则不修改)';
+}
+$('bark_save').onclick=async function(){
+  var b=this;b.disabled=true;b.innerHTML='<span class="spin"></span> 保存中';
+  try{
+    var d=await api('/api/tg',{action:'bark_save',url:$('bark_url').value.trim(),key:$('bark_key').value.trim()});
+    $('bark_key').value='';
+    toast('Bark 配置已保存');
+    renderTg(d);loadList().then(loadMeta);
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='保存 Bark';
+};
+$('bark_test').onclick=async function(){
+  var b=this;b.disabled=true;b.innerHTML='<span class="spin"></span> 发送中';
+  try{
+    await api('/api/tg',{action:'bark_test',url:$('bark_url').value.trim(),key:$('bark_key').value.trim()});
+    toast('Bark 测试消息已发送');
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='测试发送';
+};
 
 /* ---- 主题切换 ---- */
 function applyTheme(t){
